@@ -2,6 +2,7 @@
 
 import collections
 import hashlib
+import hmac
 import html
 import ipaddress
 import json
@@ -9,6 +10,7 @@ import math
 import os
 import queue
 import re
+import secrets
 import sqlite3
 import threading
 import time
@@ -31,6 +33,7 @@ except ImportError:
 
 
 DB_PATH = Path(os.getenv("DNS_MONITOR_DB", str(Path(__file__).with_name("dns_security.db"))))
+PASSWORD_HASH_ITERATIONS = 600_000
 SUSPICIOUS_TLDS = {
     value.strip().lower().lstrip(".")
     for value in os.getenv("DNS_SUSPICIOUS_TLDS", "xyz,top,click,work,icu,tk,ml,ga,cf,gq,ru").split(",")
@@ -266,10 +269,91 @@ def init_db() -> int:
                 title TEXT NOT NULL,
                 description TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS users (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                username TEXT NOT NULL COLLATE NOCASE UNIQUE,
+                password_salt TEXT NOT NULL,
+                password_hash TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
             PRAGMA user_version = 1;
             """
         )
     return legacy_rows
+
+
+def create_user(username: str, password: str) -> str:
+    clean_username = username.strip()
+    if not re.fullmatch(r"[A-Za-z0-9_.-]{3,32}", clean_username):
+        raise ValueError("Username must be 3-32 characters and use only letters, numbers, dots, underscores, or hyphens.")
+    if not 8 <= len(password) <= 128:
+        raise ValueError("Password must be between 8 and 128 characters.")
+
+    salt = secrets.token_bytes(16)
+    password_hash = hashlib.pbkdf2_hmac(
+        "sha256", password.encode("utf-8"), salt, PASSWORD_HASH_ITERATIONS
+    ).hex()
+    try:
+        with get_db_connection() as connection:
+            connection.execute(
+                "INSERT INTO users (username, password_salt, password_hash) VALUES (?, ?, ?)",
+                (clean_username, salt.hex(), password_hash),
+            )
+    except sqlite3.IntegrityError as error:
+        raise ValueError("That username is already registered.") from error
+    return clean_username
+
+
+def authenticate_user(username: str, password: str) -> bool:
+    if len(password) > 128:
+        return False
+    with get_db_connection() as connection:
+        user = connection.execute(
+            "SELECT password_salt, password_hash FROM users WHERE username = ? COLLATE NOCASE",
+            (username.strip(),),
+        ).fetchone()
+
+    salt = bytes.fromhex(user["password_salt"]) if user else bytes(16)
+    expected_hash = user["password_hash"] if user else "0" * 64
+    actual_hash = hashlib.pbkdf2_hmac(
+        "sha256", password.encode("utf-8"), salt, PASSWORD_HASH_ITERATIONS
+    ).hex()
+    return bool(user) and hmac.compare_digest(actual_hash, expected_hash)
+
+
+def render_auth_page() -> None:
+    st.markdown("# DNS / SENTINEL")
+    st.caption("Sign in or create an account to access system monitoring.")
+    login_tab, signup_tab = st.tabs(["Log in", "Sign up"])
+
+    with login_tab:
+        with st.form("login_form"):
+            username = st.text_input("Username", key="login_username", max_chars=32)
+            password = st.text_input("Password", type="password", key="login_password", max_chars=128)
+            submitted = st.form_submit_button("Log in", type="primary", width="stretch")
+        if submitted:
+            if authenticate_user(username, password):
+                st.session_state.authenticated_user = username.strip()
+                st.rerun()
+            st.error("Invalid username or password.")
+
+    with signup_tab:
+        with st.form("signup_form"):
+            username = st.text_input("Username", key="signup_username", max_chars=32)
+            password = st.text_input("Password", type="password", key="signup_password", max_chars=128)
+            confirm_password = st.text_input("Confirm password", type="password", max_chars=128)
+            submitted = st.form_submit_button("Create account", type="primary", width="stretch")
+        if submitted:
+            if password != confirm_password:
+                st.error("Passwords do not match.")
+            else:
+                try:
+                    account_name = create_user(username, password)
+                except ValueError as error:
+                    st.error(str(error))
+                else:
+                    st.session_state.authenticated_user = account_name
+                    st.rerun()
 
 
 def record_observation(
@@ -1007,6 +1091,10 @@ def run_dashboard() -> None:
         initial_sidebar_state="expanded",
     )
     legacy_rows_cleared = init_db()
+    if not st.session_state.get("authenticated_user"):
+        render_auth_page()
+        return
+
     monitor = get_global_monitor()
     if not st.session_state.get("capture_initialized"):
         monitor.start()
@@ -1087,6 +1175,10 @@ def run_dashboard() -> None:
             '<div class="brand-sub">LOCAL RESOLVER TELEMETRY</div></div>',
             unsafe_allow_html=True,
         )
+        st.caption(f"Signed in as {st.session_state.authenticated_user}")
+        if st.button("Log out", width="stretch"):
+            del st.session_state["authenticated_user"]
+            st.rerun()
         st.markdown('<div class="section-label">OPERATIONS</div>', unsafe_allow_html=True)
         pages = [
             "Dashboard", "Live DNS Monitor", "Domain Analysis", "Threat Detection",
