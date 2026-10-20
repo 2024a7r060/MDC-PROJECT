@@ -19,6 +19,7 @@ from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterator
+from urllib.parse import urlsplit
 
 import pandas as pd
 import requests
@@ -49,7 +50,7 @@ DNS_TYPE_MAP = {
     16: "TXT", 28: "AAAA", 33: "SRV", 35: "NAPTR", 64: "SVCB", 65: "HTTPS",
 }
 RCODE_MAP = {0: "NOERROR", 1: "FORMERR", 2: "SERVFAIL", 3: "NXDOMAIN", 5: "REFUSED"}
-_VT_CACHE: dict[str, tuple[float, dict[str, Any]]] = {}
+_VT_CACHE: dict[tuple[str, str], tuple[float, dict[str, Any]]] = {}
 _VT_LOCK = threading.Lock()
 
 
@@ -78,20 +79,66 @@ def parse_domain_components(domain: str) -> dict[str, Any]:
     return {"clean_domain": clean, "subdomain": subdomain, "sld": sld, "tld": tld, "labels": labels}
 
 
+def normalize_website_target(value: str) -> str:
+    """Return a validated hostname from a URL or bare domain without visiting it."""
+    target = value.strip()
+    if not target:
+        raise ValueError("Enter a website URL or domain.")
+    if "://" not in target:
+        target = f"https://{target}"
+    try:
+        parsed = urlsplit(target)
+        hostname = parsed.hostname
+        parsed.port
+    except ValueError as error:
+        raise ValueError("Enter a valid website URL or domain.") from error
+    if parsed.scheme.lower() not in {"http", "https"} or not hostname:
+        raise ValueError("Enter a valid http:// or https:// website URL or domain.")
+    if parsed.username is not None or parsed.password is not None:
+        raise ValueError("URLs containing username or password information are not supported.")
+    try:
+        address = ipaddress.ip_address(hostname)
+    except ValueError:
+        try:
+            hostname = hostname.rstrip(".").encode("idna").decode("ascii").lower()
+        except UnicodeError as error:
+            raise ValueError("The website hostname is not valid.") from error
+        labels = hostname.split(".")
+        if (
+            len(labels) < 2
+            or len(hostname) > 253
+            or any(
+                not label
+                or len(label) > 63
+                or re.fullmatch(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?", label) is None
+                for label in labels
+            )
+        ):
+            raise ValueError("Enter a valid website hostname or IP address.")
+        return hostname
+    return str(address)
+
+
 def _virustotal_reputation(domain: str) -> dict[str, Any]:
     api_key = os.getenv("DNS_VIRUSTOTAL_API_KEY", "").strip()
     if not api_key:
         return {"available": False, "reason": "VirusTotal lookup is not configured."}
 
     now = time.monotonic()
+    cache_key = (domain, api_key)
     with _VT_LOCK:
-        cached = _VT_CACHE.get(domain)
+        cached = _VT_CACHE.get(cache_key)
         if cached and now - cached[0] < 3600:
             return cached[1]
 
     try:
+        try:
+            ipaddress.ip_address(domain)
+            indicator_path = f"ip_addresses/{domain}"
+        except ValueError:
+            indicator_path = f"domains/{domain}"
         response = requests.get(
-            f"https://www.virustotal.com/api/v3/domains/{domain}",
+            f"https://www.virustotal.com/api/v3/{indicator_path}",
             headers={"x-apikey": api_key},
             timeout=2.5,
         )
@@ -99,18 +146,40 @@ def _virustotal_reputation(domain: str) -> dict[str, Any]:
             result = {"available": False, "reason": "VirusTotal has no report for this domain."}
         else:
             response.raise_for_status()
-            stats = response.json().get("data", {}).get("attributes", {}).get("last_analysis_stats", {})
-            result = {
-                "available": True,
-                "malicious": int(stats.get("malicious", 0)),
-                "suspicious": int(stats.get("suspicious", 0)),
-                "source": "VirusTotal",
-            }
-    except (requests.RequestException, ValueError, TypeError) as error:
+            stats = response.json().get("data", {}).get("attributes", {}).get("last_analysis_stats")
+            if not isinstance(stats, dict) or not stats:
+                result = {
+                    "available": False,
+                    "reason": "VirusTotal returned no completed analysis statistics for this domain.",
+                }
+            else:
+                normalized_stats = {}
+                for key in ("malicious", "suspicious", "harmless", "undetected", "timeout", "confirmed-timeout", "failure", "type-unsupported", "unrated"):
+                    if key in stats:
+                        try:
+                            count = int(stats[key])
+                        except (TypeError, ValueError) as error:
+                            raise ValueError("VirusTotal returned invalid analysis statistics.") from error
+                        if count < 0:
+                            raise ValueError("VirusTotal returned invalid analysis statistics.")
+                        normalized_stats[key] = count
+                if not normalized_stats or sum(normalized_stats.values()) == 0:
+                    result = {
+                        "available": False,
+                        "reason": "VirusTotal has no completed engine results for this domain.",
+                    }
+                else:
+                    result = {
+                        "available": True,
+                        "malicious": normalized_stats.get("malicious", 0),
+                        "suspicious": normalized_stats.get("suspicious", 0),
+                        "source": "VirusTotal",
+                    }
+    except (requests.RequestException, ValueError, TypeError, AttributeError) as error:
         result = {"available": False, "reason": f"VirusTotal lookup failed: {error.__class__.__name__}."}
 
     with _VT_LOCK:
-        _VT_CACHE[domain] = (now, result)
+        _VT_CACHE[cache_key] = (now, result)
     return result
 
 
@@ -133,9 +202,13 @@ def analyze_domain(
         impact = min(100, 70 + 10 * (reputation["malicious"] - 1))
         score += impact
         reasons.append(f"VirusTotal reported {reputation['malicious']} malicious detection(s). (+{impact})")
-    elif reputation.get("available"):
-        reasons.append("No malicious detections were reported in the available VirusTotal result.")
-    else:
+    if reputation.get("available") and reputation.get("suspicious", 0) > 0:
+        impact = min(40, 20 + 5 * (reputation["suspicious"] - 1))
+        score += impact
+        reasons.append(f"VirusTotal reported {reputation['suspicious']} suspicious detection(s). (+{impact})")
+    if reputation.get("available") and not reputation.get("malicious", 0) and not reputation.get("suspicious", 0):
+        reasons.append("No malicious or suspicious detections were reported in the available VirusTotal result.")
+    elif not reputation.get("available"):
         reasons.append(reputation.get("reason", "No external threat-intelligence result is available."))
 
     tld = components["tld"]
@@ -191,7 +264,11 @@ def analyze_domain(
         suspicious_at, high_at = 30, 70
     if not 0 <= suspicious_at < high_at <= 100:
         suspicious_at, high_at = 30, 70
-    if score >= high_at:
+    if reputation.get("available") and reputation.get("malicious", 0) > 0:
+        classification = "HIGH RISK"
+    elif reputation.get("available") and reputation.get("suspicious", 0) > 0:
+        classification = "SUSPICIOUS"
+    elif score >= high_at:
         classification = "HIGH RISK"
     elif score >= suspicious_at:
         classification = "SUSPICIOUS"
@@ -211,6 +288,27 @@ def analyze_domain(
         "query_frequency": query_frequency,
         "unique_subdomains": unique_subdomains,
         "threat_intelligence": reputation,
+    }
+
+
+def check_website(value: str) -> dict[str, Any]:
+    """Assess a submitted URL using hostname heuristics and configured reputation data."""
+    hostname = normalize_website_target(value)
+    analysis = analyze_domain(hostname)
+    reputation = analysis["threat_intelligence"]
+    suspicious = analysis["classification"] != "SAFE"
+    return {
+        "domain": hostname,
+        "classification": "SUSPICIOUS" if suspicious else "SAFE",
+        "verification_status": "COMPLETE" if reputation.get("available") else "LIMITED",
+        "risk_score": analysis["risk_score"],
+        "reasons": analysis["reasons"],
+        "reputation_source": reputation.get("source"),
+        "reputation_status": (
+            "Completed"
+            if reputation.get("available")
+            else reputation.get("reason", "No reputation data is available.")
+        ),
     }
 
 
@@ -989,6 +1087,48 @@ def render_domain_analysis() -> None:
     event_table(get_queries(limit=1000, domain_filter=selected_domain), limit=100)
 
 
+def render_website_checker() -> None:
+    st.markdown("## Website checker")
+    st.caption(
+        "Check a URL or domain before opening it. This checker analyzes the hostname and does not load the website."
+    )
+    st.info(
+        "When configured, the hostname is sent to VirusTotal for a reputation lookup. "
+        "Without an API key or available report, the result is marked as limited verification."
+    )
+    with st.form("website_checker_form"):
+        target = st.text_input(
+            "Website URL or domain",
+            placeholder="https://example.com/login",
+            help="Only the hostname is analyzed; the website page is not visited.",
+        )
+        submitted = st.form_submit_button("Check website", type="primary")
+    if not submitted:
+        return
+    try:
+        result = check_website(target)
+    except ValueError as error:
+        st.error(str(error))
+        return
+
+    st.markdown(f"### `{html.escape(result['domain'])}`")
+    if result["classification"] == "SUSPICIOUS":
+        st.error("SUSPICIOUS WEBSITE")
+    else:
+        st.success("SAFE — no suspicious indicator was detected by the available checks.")
+    if result["verification_status"] == "LIMITED":
+        st.warning(
+            f"Verification limited: {result['reputation_status']} "
+            "This result is not a guarantee that the website is safe."
+        )
+    else:
+        st.caption(f"Reputation check completed by {result['reputation_source']}. This is not a guarantee of safety.")
+    st.metric("Heuristic risk score", f"{result['risk_score']}/100")
+    st.markdown("**Evidence and reasons**")
+    for reason in result["reasons"]:
+        st.markdown(f"- {html.escape(reason)}")
+
+
 def render_threat_detection() -> None:
     st.markdown("## Threat detection")
     st.caption("Latest observed classification for each domain. Unusual appearance alone is not treated as malicious.")
@@ -1181,7 +1321,7 @@ def run_dashboard() -> None:
             st.rerun()
         st.markdown('<div class="section-label">OPERATIONS</div>', unsafe_allow_html=True)
         pages = [
-            "Dashboard", "Live DNS Monitor", "Domain Analysis", "Threat Detection",
+            "Dashboard", "Live DNS Monitor", "Website Checker", "Domain Analysis", "Threat Detection",
             "DNS Anomalies", "Alerts", "Logs", "Settings",
         ]
         if "active_view" not in st.session_state:
@@ -1235,6 +1375,8 @@ def run_dashboard() -> None:
         live_monitor_view()
     elif page == "Domain Analysis":
         render_domain_analysis()
+    elif page == "Website Checker":
+        render_website_checker()
     elif page == "Threat Detection":
         render_threat_detection()
     elif page == "DNS Anomalies":
